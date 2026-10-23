@@ -1,14 +1,21 @@
 import QtQuick
 import QtQuick.Layouts
+import org.kde.plasma.plasmoid
 import org.kde.plasma.components as PC3
+import org.kde.kirigami as Kirigami
+import "../code/glyphs.js" as Glyphs
 
-// Previous and next track buttons
+// Previous and next track buttons (style set in Look & Feel)
 PC3.ToolButton {
     id: btn
 
     property bool forward: true
     property real size: 24
     property color glyphColor: "white"
+    property string style: Plasmoid.configuration.buttonStyle || "classic"
+    // for the capsule style: "left", "middle", "right" or "single"
+    property string segment: "single"
+    readonly property string kind: forward ? "next" : "prev"
 
     Layout.preferredWidth: size
     Layout.preferredHeight: size
@@ -18,48 +25,35 @@ PC3.ToolButton {
         implicitHeight: btn.size
         opacity: btn.enabled ? 1.0 : 0.35
 
-        readonly property real g: btn.size * 0.34
-        readonly property real cx: width / 2
-        readonly property real cy: height / 2
-
-        // end bar
-        Rectangle {
-            width: Math.max(1.5, btn.size * 0.06)
-            height: parent.g * 1.6
-            radius: width / 2
+        Kirigami.Icon {
+            anchors.centerIn: parent
+            width: btn.size * 0.6
+            height: width
+            visible: btn.style === "icons"
+            source: Glyphs.iconName(btn.kind)
             color: btn.glyphColor
-            y: parent.cy - height / 2
-            x: btn.forward ? parent.cx + parent.g * 0.55
-                           : parent.cx - parent.g * 0.55 - width
+            isMask: true
         }
-
-        // single triangle
+        // covers the whole button, padding included, so discs aren't clipped at the
+        // edges and capsule segments meet their neighbours
         Canvas {
-            id: tri
-            anchors.fill: parent
-            onPaint: {
-                var ctx = getContext("2d");
-                ctx.reset();
-                ctx.fillStyle = btn.glyphColor;
-                var g = parent.g;
-                var cx = parent.cx, cy = parent.cy;
-                ctx.beginPath();
-                if (btn.forward) {
-                    ctx.moveTo(cx - g * 0.75, cy - g * 0.8);
-                    ctx.lineTo(cx - g * 0.75, cy + g * 0.8);
-                    ctx.lineTo(cx + g * 0.45, cy);
-                } else {
-                    ctx.moveTo(cx + g * 0.75, cy - g * 0.8);
-                    ctx.lineTo(cx + g * 0.75, cy + g * 0.8);
-                    ctx.lineTo(cx - g * 0.45, cy);
-                }
-                ctx.closePath();
-                ctx.fill();
-            }
+            id: glyph
+            x: -btn.leftPadding
+            y: -btn.topPadding
+            width: btn.width
+            height: btn.height
+            visible: btn.style !== "icons"
+            onWidthChanged: requestPaint()
+            onHeightChanged: requestPaint()
+            onPaint: Glyphs.draw(getContext("2d"), btn.kind, btn.style, width, height, btn.size,
+                                 btn.glyphColor, btn.segment)
             Connections {
                 target: btn
-                function onGlyphColorChanged() { tri.requestPaint(); }
-                function onSizeChanged() { tri.requestPaint(); }
+                function onKindChanged() { glyph.requestPaint(); }
+                function onStyleChanged() { glyph.requestPaint(); }
+                function onGlyphColorChanged() { glyph.requestPaint(); }
+                function onSizeChanged() { glyph.requestPaint(); }
+                function onSegmentChanged() { glyph.requestPaint(); }
             }
         }
     }

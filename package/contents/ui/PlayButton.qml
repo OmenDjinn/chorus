@@ -1,14 +1,21 @@
 import QtQuick
 import QtQuick.Layouts
+import org.kde.plasma.plasmoid
 import org.kde.plasma.components as PC3
+import org.kde.kirigami as Kirigami
+import "../code/glyphs.js" as Glyphs
 
-// Play / pause button, hand-drawn to match SkipButton
+// Play / pause button, hand-drawn to match SkipButton (style set in Look & Feel)
 PC3.ToolButton {
     id: btn
 
     property bool playing: false
     property real size: 24
     property color glyphColor: "white"
+    property string style: Plasmoid.configuration.buttonStyle || "classic"
+    // for the capsule style: "left", "middle", "right" or "single"
+    property string segment: "single"
+    readonly property string kind: playing ? "pause" : "play"
 
     Layout.preferredWidth: size
     Layout.preferredHeight: size
@@ -18,37 +25,35 @@ PC3.ToolButton {
         implicitHeight: btn.size
         opacity: btn.enabled ? 1.0 : 0.35
 
+        Kirigami.Icon {
+            anchors.centerIn: parent
+            width: btn.size * 0.7
+            height: width
+            visible: btn.style === "icons"
+            source: Glyphs.iconName(btn.kind)
+            color: btn.glyphColor
+            isMask: true
+        }
+        // covers the whole button, padding included, so discs aren't clipped at the
+        // edges and capsule segments meet their neighbours
         Canvas {
             id: glyph
-            anchors.fill: parent
-            onPaint: {
-                var ctx = getContext("2d");
-                ctx.reset();
-                ctx.fillStyle = btn.glyphColor;
-                var g = btn.size * 0.34;
-                var cx = width / 2, cy = height / 2;
-                if (btn.playing) {
-                    var bw = Math.max(2, btn.size * 0.13);
-                    var bh = g * 1.7;
-                    var gap = btn.size * 0.09;
-                    ctx.beginPath();
-                    ctx.roundedRect(cx - gap - bw, cy - bh / 2, bw, bh, bw / 2, bw / 2);
-                    ctx.roundedRect(cx + gap, cy - bh / 2, bw, bh, bw / 2, bw / 2);
-                    ctx.fill();
-                } else {
-                    ctx.beginPath();
-                    ctx.moveTo(cx - g * 0.6, cy - g * 0.85);
-                    ctx.lineTo(cx - g * 0.6, cy + g * 0.85);
-                    ctx.lineTo(cx + g * 0.8, cy);
-                    ctx.closePath();
-                    ctx.fill();
-                }
-            }
+            x: -btn.leftPadding
+            y: -btn.topPadding
+            width: btn.width
+            height: btn.height
+            visible: btn.style !== "icons"
+            onWidthChanged: requestPaint()
+            onHeightChanged: requestPaint()
+            onPaint: Glyphs.draw(getContext("2d"), btn.kind, btn.style, width, height, btn.size,
+                                 btn.glyphColor, btn.segment)
             Connections {
                 target: btn
-                function onPlayingChanged() { glyph.requestPaint(); }
+                function onKindChanged() { glyph.requestPaint(); }
+                function onStyleChanged() { glyph.requestPaint(); }
                 function onGlyphColorChanged() { glyph.requestPaint(); }
                 function onSizeChanged() { glyph.requestPaint(); }
+                function onSegmentChanged() { glyph.requestPaint(); }
             }
         }
     }

@@ -56,8 +56,11 @@ PlasmoidItem {
     }
 
     readonly property var player: mpris.currentPlayer
+    readonly property bool soloistMode: Plasmoid.configuration.appMode === "soloist"
     readonly property var cfgMatchList: {
         var mode = Plasmoid.configuration.appMode;
+        // Spotify Soloist: follow only its bridge, so browser tabs never take over the widget
+        if (mode === "soloist") return ["soloist"];
         if (mode !== "custom") return [];
         var parts = (Plasmoid.configuration.playerMatch || "").toLowerCase().split(",");
         var out = [];
@@ -572,7 +575,8 @@ PlasmoidItem {
         searchProvider === "pear" ? "youtube" : searchProvider === "spotify" ? "spotify" : ""
     readonly property bool searchAppRunning: appRunning(searchAppToken)
     readonly property string searchAppName:
-        searchProvider === "pear" ? i18n("YouTube Music") : searchProvider === "spotify" ? i18n("Spotify") : ""
+        searchProvider === "pear" ? i18n("YouTube Music")
+        : searchProvider === "spotify" ? (soloistMode ? i18n("Spotify Soloist") : i18n("Spotify")) : ""
     readonly property var searchApi: pear !== null ? pear : spotifyApi
     readonly property bool showAppButton: searchApi !== null && !(searchProvider === "pear"
         ? Plasmoid.configuration.pearHideAppButton
@@ -686,8 +690,15 @@ PlasmoidItem {
     toolTipTextFormat: Text.PlainText
     hideOnWindowDeactivate: true
 
+    // "default" (theme font), "system" (an installed family) or "file" (font files);
+    // configs from before fontMode existed only have the useCustomFont switch
+    readonly property string fontMode: {
+        var m = Plasmoid.configuration.fontMode;
+        if (m === "default" || m === "system" || m === "file") return m;
+        return Plasmoid.configuration.useCustomFont ? "file" : "default";
+    }
     readonly property var fontSources: {
-        if (!Plasmoid.configuration.useCustomFont) return [];
+        if (fontMode !== "file") return [];
         var out = [];
         var all = [String(Plasmoid.configuration.fontPath || "")]
             .concat(Plasmoid.configuration.fontFallbacks || []);
@@ -720,8 +731,9 @@ PlasmoidItem {
         loadedFamilies = out;
     }
 
-    readonly property string cfgFont: loadedFamilies.length > 0
-        ? loadedFamilies[0]
+    readonly property string cfgFont: fontMode === "system" && Plasmoid.configuration.systemFont !== ""
+        ? Plasmoid.configuration.systemFont
+        : loadedFamilies.length > 0 ? loadedFamilies[0]
         : Kirigami.Theme.defaultFont.family
     readonly property string cfgFontCss: {
         if (loadedFamilies.length < 2) return "";
@@ -733,6 +745,39 @@ PlasmoidItem {
         }
         return out.join(", ");
     }
+    // "Pixel" text style: a bundled pixel font drawn at its native grid size and magnified
+    // by a whole number without smoothing (see PanelText), so letters are crisp blocks like
+    // the Pixel buttons. grid = the font's pixels per em, measured from its outlines;
+    // looks = how big it reads next to a regular font of the same size.
+    readonly property bool pixelText: Plasmoid.configuration.textStyle === "pixel"
+    readonly property var pixelFonts: ({
+        micro5: { file: "Micro5-Regular.ttf", grid: 11, looks: 0.8 },
+        press: { file: "PressStart2P-Regular.ttf", grid: 8, looks: 1.25 },
+        silkscreen: { file: "Silkscreen-Regular.ttf", grid: 8, looks: 1 },
+        jacquard: { file: "Jacquard12-Regular.ttf", grid: 21, looks: 1 }
+    })
+    // "pixelify" was an earlier default that isn't on a pixel grid
+    readonly property var pixelFontInfo: pixelFonts[Plasmoid.configuration.pixelFont] || pixelFonts.micro5
+    FontLoader {
+        id: pixelFontLoader
+        source: root.pixelText ? Qt.resolvedUrl("../fonts/" + root.pixelFontInfo.file) : ""
+    }
+    readonly property bool pixelReady: pixelText && pixelFontLoader.status === FontLoader.Ready
+    // panel text uses these: the pixel font when that style is on, the configured font otherwise
+    readonly property string textFont: pixelReady ? pixelFontLoader.name : cfgFont
+    readonly property string textCss: pixelReady ? "" : cfgFontCss
+    // a size snapped to whole multiples of the pixel grid, and its magnification
+    function pixelFactor(px) {
+        return pixelReady ? Math.max(1, Math.round(px / (pixelFontInfo.grid * pixelFontInfo.looks))) : 1;
+    }
+    function textPx(px) {
+        return pixelReady ? pixelFontInfo.grid * pixelFactor(px) : px;
+    }
+    // the pixel fonts come in one weight; a faked bold would smear the pixels
+    function textWeight(w) {
+        return pixelReady ? Font.Normal : w;
+    }
+
     readonly property color cActive: Plasmoid.configuration.activeColor
     readonly property color cInactive: Qt.alpha(cActive, 0.55)
 
@@ -763,29 +808,35 @@ PlasmoidItem {
         readonly property real thick: vertical ? width : height
         readonly property real screenLen: vertical ? Screen.height : Screen.width
         readonly property real pad: Kirigami.Units.smallSpacing
-        readonly property real coverSize: Math.round(thick * 0.80)
+        readonly property real coverSize: Math.round(thick * Math.max(20, Math.min(100, Plasmoid.configuration.coverScale)) / 100)
+        readonly property real buttonSize: thick * Math.max(30, Math.min(100, Plasmoid.configuration.buttonScale)) / 100
+        readonly property bool showTitle: Plasmoid.configuration.showTitle && root.dispTitle !== ""
         readonly property real minTotalW: screenLen * Plasmoid.configuration.minFrac
-        readonly property real lyricsMaxW: Math.max(80, screenLen * Plasmoid.configuration.maxFrac
-                                                    - coverSize - buttonsRow.width - 8 * pad)
-        readonly property int lyricPx: Math.max(10, Math.round(thick * 0.46 * Plasmoid.configuration.fontScale))
+        // how wide lyrics may get before they're cut off or scroll: a set share of the screen,
+        // or (0) whatever the widget's max width leaves after the cover, title and buttons
+        readonly property real lyricsMaxW: Plasmoid.configuration.lyricsWidth > 0
+            ? screenLen * Plasmoid.configuration.lyricsWidth / 100
+            : Math.max(80, screenLen * Plasmoid.configuration.maxFrac
+                           - (coverBox.visible ? coverSize : 0)
+                           - (titleBox.visible ? titleBox.width : 0)
+                           - buttonsRow.width - 8 * pad)
+        readonly property int lyricPx: root.textPx(Math.max(10, Math.round(thick * 0.46 * Plasmoid.configuration.fontScale)))
 
         readonly property real liveLen: shown ? Math.max(row.implicitWidth, minTotalW) : 0
+        // while hovered or open the widget doesn't shrink under the mouse (it may still grow)
         property real frozenLen: 0
-        property real frozenViewportW: Number.POSITIVE_INFINITY
         readonly property bool hold: root.expanded || barHover.hovered
         readonly property real contentLen: hold ? Math.max(frozenLen, liveLen) : liveLen
         function captureFrozen() {
             var fixedW = row.implicitWidth - viewport.Layout.preferredWidth;
             var uncappedVw = Math.min(curText.implicitWidth + 2, lyricsMaxW);
             frozenLen = shown ? Math.max(fixedW + uncappedVw, minTotalW) : 0;
-            frozenViewportW = Math.max(0, frozenLen - fixedW);
         }
         onHoldChanged: {
             if (hold) {
                 captureFrozen();
             } else {
                 frozenLen = 0;
-                frozenViewportW = Number.POSITIVE_INFINITY;
             }
         }
         onShownChanged: if (hold) captureFrozen()
@@ -813,6 +864,8 @@ PlasmoidItem {
                                           || root.lineIdx < 0 || root.lineIdx >= root.lines.length
         readonly property string displayText: {
             if (root.dispTitle === "") return i18n("Nothing playing");
+            // the title already shows next to the cover, don't repeat it
+            if (titleMode && showTitle) return "♪";
             if (titleMode)
                 return Lrc.normalize(root.dispTitle) + (root.dispArtist ? "  -  " + Lrc.normalize(root.dispArtist) : "");
             var t = root.lines[root.lineIdx].text;
@@ -823,18 +876,21 @@ PlasmoidItem {
             lineSlide(displayText);
             marquee.reset();
         }
+        // "slide" moves lines up, "fade" cross-fades them in place, "none" swaps instantly
+        readonly property string lineAnimation: Plasmoid.configuration.lyricsAnimation || "slide"
+        readonly property real slideDistance: lineAnimation === "slide" ? thick * 0.55 : 0
         function lineSlide(newText) {
             slideAnim.stop();
             var animate = shownOnce && newText !== "" && bar.shown && root.winVisible
-                          && !titleMode && root.isPlaying;
+                          && !titleMode && root.isPlaying && lineAnimation !== "none";
             prevText.text = curText.text;
-            curText.text = Lrc.fontSpan(newText, root.cfgFontCss);
+            curText.text = Lrc.fontSpan(newText, root.textCss);
             shownOnce = true;
             if (animate && prevText.text !== "") {
                 prevText.opacity = 1;
                 prevText.y = curText.yBase;
                 curText.opacity = 0;
-                curText.y = curText.yBase + bar.thick * 0.55;
+                curText.y = curText.yBase + bar.slideDistance;
                 curText.color = root.cInactive;
                 slideAnim.start();
             } else {
@@ -847,12 +903,12 @@ PlasmoidItem {
         property bool shownOnce: false
         Connections {
             target: root
-            function onCfgFontCssChanged() {
+            function onTextCssChanged() {
                 slideAnim.stop();
                 prevText.text = "";
                 prevText.opacity = 0;
                 curText.opacity = 1;
-                curText.text = Lrc.fontSpan(bar.displayText, root.cfgFontCss);
+                curText.text = Lrc.fontSpan(bar.displayText, root.textCss);
             }
         }
         onTitleModeChanged: if (titleMode) { slideAnim.stop(); curText.opacity = 1; curText.color = Qt.binding(function () { return root.cActive; }); curText.y = Qt.binding(function () { return curText.yBase; }); prevText.opacity = 0; }
@@ -874,13 +930,20 @@ PlasmoidItem {
                 Layout.minimumWidth: bar.coverSize
                 Layout.preferredHeight: bar.coverSize
                 Layout.alignment: Qt.AlignVCenter
+                // offsets move the cover without changing the bar's layout
+                transform: Translate {
+                    x: Plasmoid.configuration.coverOffsetX
+                    y: Plasmoid.configuration.coverOffsetY
+                }
 
                 CoverImage {
                     id: coverImg
                     anchors.fill: parent
                     src: root.dispArt
-                    px: 128
-                    radius: Math.max(3, bar.coverSize * 0.14)
+                    px: Math.max(128, bar.coverSize * 2)
+                    radius: Plasmoid.configuration.coverShape === "circle" ? bar.coverSize / 2
+                          : Plasmoid.configuration.coverShape === "square" ? 0
+                          : Math.max(3, bar.coverSize * 0.14)
                     visible: root.dispArt != "" && !coverImg.failed
                 }
                 Kirigami.Icon {
@@ -893,7 +956,85 @@ PlasmoidItem {
                 }
             }
 
+            // song name (and artist) next to the cover
+            ColumnLayout {
+                id: titleBox
+                visible: bar.showTitle
+                spacing: 0
+                Layout.alignment: Qt.AlignVCenter
+                Layout.maximumWidth: maxW
+                readonly property real maxW: Math.round(bar.screenLen * 0.12)
+                readonly property bool withArtist: Plasmoid.configuration.showTitleArtist && root.dispArtist !== ""
+                // sized from the panel, independent of the lyrics' font scale
+                readonly property real basePx: bar.thick * 0.46
+                function pct(v) { return Math.max(50, Math.min(200, v)) / 100; }
+                // Size for a line whose nominal size is `base`. With auto on it shrinks to fit
+                // the box (down to half size, then it elides), measured by `metrics`; in the
+                // pixel style it steps down whole magnifications so it stays crisp.
+                function sizeFor(base, auto, metrics) {
+                    var w = metrics.advanceWidth + 2;
+                    if (root.pixelReady) {
+                        var k = root.pixelFactor(base);
+                        if (auto && metrics.text !== "")
+                            k = Math.max(1, Math.min(k, Math.floor(maxW / w)));
+                        return { px: root.pixelFontInfo.grid * k, factor: k };
+                    }
+                    var px = base;
+                    if (auto && metrics.text !== "" && w > maxW)
+                        px = Math.max(Math.round(base * 0.5), Math.floor(base * maxW / w));
+                    return { px: px, factor: 1 };
+                }
+
+                PanelText {
+                    id: titleLine
+                    readonly property bool auto: Plasmoid.configuration.titleAutoSize
+                    readonly property int basePx: Math.round(titleBox.basePx * (titleBox.withArtist ? 0.78 : 0.9)
+                                                             * (auto ? 1 : titleBox.pct(Plasmoid.configuration.titleScale)))
+                    readonly property var fit: titleBox.sizeFor(basePx, auto, titleMetrics)
+                    Layout.fillWidth: true
+                    text: Lrc.normalize(root.dispTitle)
+                    elide: Text.ElideRight
+                    color: root.cActive
+                    family: root.textFont
+                    pixelSize: fit.px
+                    weight: root.textWeight(Font.Bold)
+                    pixel: root.pixelReady
+                    factor: fit.factor
+                    // natural width at the nominal size (at grid size in the pixel style)
+                    TextMetrics {
+                        id: titleMetrics
+                        text: titleLine.auto ? titleLine.text : ""
+                        font.family: root.textFont
+                        font.weight: root.textWeight(Font.Bold)
+                        font.pixelSize: root.pixelReady ? root.pixelFontInfo.grid : titleLine.basePx
+                    }
+                }
+                PanelText {
+                    id: artistLine
+                    readonly property bool auto: Plasmoid.configuration.artistAutoSize
+                    readonly property int basePx: Math.round(titleBox.basePx * 0.66
+                                                             * (auto ? 1 : titleBox.pct(Plasmoid.configuration.artistScale)))
+                    readonly property var fit: titleBox.sizeFor(basePx, auto, artistMetrics)
+                    Layout.fillWidth: true
+                    visible: titleBox.withArtist
+                    text: Lrc.normalize(root.dispArtist)
+                    elide: Text.ElideRight
+                    color: root.cInactive
+                    family: root.textFont
+                    pixelSize: fit.px
+                    pixel: root.pixelReady
+                    factor: fit.factor
+                    TextMetrics {
+                        id: artistMetrics
+                        text: artistLine.auto ? artistLine.text : ""
+                        font.family: root.textFont
+                        font.pixelSize: root.pixelReady ? root.pixelFontInfo.grid : artistLine.basePx
+                    }
+                }
+            }
+
             Rectangle {
+                visible: Plasmoid.configuration.showDividers
                 Layout.preferredWidth: 1
                 Layout.preferredHeight: bar.thick * 0.55
                 Layout.alignment: Qt.AlignVCenter
@@ -905,10 +1046,16 @@ PlasmoidItem {
 
             Item {
                 id: viewport
+                transform: Translate {
+                    x: Plasmoid.configuration.lyricsOffsetX
+                    y: Plasmoid.configuration.lyricsOffsetY
+                }
                 opacity: root.isActive || root.hasTrack ? 1.0 : 0.65
                 Layout.alignment: Qt.AlignVCenter
                 Layout.preferredHeight: bar.thick
-                Layout.preferredWidth: Math.min(curText.implicitWidth + 2, bar.lyricsMaxW, bar.frozenViewportW)
+                // not capped by the width captured when hovering began: if that happened on a
+                // short line ("♪"), every following line was cut to a letter or two
+                Layout.preferredWidth: Math.min(curText.implicitWidth + 2, bar.lyricsMaxW)
                 clip: true
 
                 Item {
@@ -916,35 +1063,41 @@ PlasmoidItem {
                     height: parent.height
                     width: curText.implicitWidth
 
-                    Text {
-                        textFormat: root.cfgFontCss !== "" ? Text.RichText : Text.PlainText
+                    PanelText {
+                        textFormat: root.textCss !== "" ? Text.RichText : Text.PlainText
                         id: prevText
-                        readonly property real yBase: (content.height - height) / 2
+                        // whole pixels, so magnified pixel text isn't resampled between them
+                        readonly property real yBase: Math.round((content.height - height) / 2)
                         y: yBase
                         opacity: 0
                         color: root.cActive
-                        font.family: root.cfgFont
-                        font.pixelSize: bar.lyricPx
-                        font.weight: Font.DemiBold
+                        family: root.textFont
+                        pixelSize: bar.lyricPx
+                        weight: root.textWeight(Plasmoid.configuration.fontWeight)
+                        pixel: root.pixelReady
+                        factor: root.pixelFactor(bar.lyricPx)
                     }
 
-                    Text {
-                        textFormat: root.cfgFontCss !== "" ? Text.RichText : Text.PlainText
+                    PanelText {
+                        textFormat: root.textCss !== "" ? Text.RichText : Text.PlainText
                         id: curText
-                        readonly property real yBase: (content.height - height) / 2
+                        // whole pixels, so magnified pixel text isn't resampled between them
+                        readonly property real yBase: Math.round((content.height - height) / 2)
                         y: yBase
-                        text: Lrc.fontSpan(bar.displayText, root.cfgFontCss)
+                        text: Lrc.fontSpan(bar.displayText, root.textCss)
                         color: root.cActive
-                        font.family: root.cfgFont
-                        font.pixelSize: bar.lyricPx
-                        font.weight: Font.DemiBold
+                        family: root.textFont
+                        pixelSize: bar.lyricPx
+                        weight: root.textWeight(Plasmoid.configuration.fontWeight)
+                        pixel: root.pixelReady
+                        factor: root.pixelFactor(bar.lyricPx)
                     }
 
                     ParallelAnimation {
                         id: slideAnim
                         NumberAnimation {
                             target: prevText; property: "y"
-                            to: prevText.yBase - bar.thick * 0.55
+                            to: prevText.yBase - bar.slideDistance
                             duration: 380; easing.type: Easing.OutCubic
                         }
                         NumberAnimation {
@@ -1004,6 +1157,7 @@ PlasmoidItem {
             Item { Layout.fillWidth: true; Layout.preferredWidth: bar.pad }
 
             Rectangle {
+                visible: Plasmoid.configuration.showButtonDivider && buttonsRow.visible
                 Layout.preferredWidth: 1
                 Layout.preferredHeight: bar.thick * 0.55
                 Layout.alignment: Qt.AlignVCenter
@@ -1011,29 +1165,37 @@ PlasmoidItem {
                 opacity: 0.25
             }
 
+            // "all", "play" (play/pause only) or "none"
             RowLayout {
                 id: buttonsRow
+                readonly property string shown: Plasmoid.configuration.buttonsShown || "all"
+                visible: shown !== "none"
                 spacing: 0
                 Layout.alignment: Qt.AlignVCenter
                 Layout.minimumWidth: implicitWidth
 
                 SkipButton {
+                    visible: buttonsRow.shown === "all"
                     forward: false
-                    size: bar.thick * 0.9
+                    segment: "left"
+                    size: bar.buttonSize
                     glyphColor: root.cActive
                     enabled: root.playerMatches && root.trackTitle !== "" && root.player.canGoPrevious
                     onClicked: root.doPrev()
                 }
                 PlayButton {
                     playing: root.isPlaying
-                    size: bar.thick * 0.9
+                    segment: buttonsRow.shown === "all" ? "middle" : "single"
+                    size: bar.buttonSize
                     glyphColor: root.cActive
                     enabled: root.playerMatches && root.trackTitle !== ""
                     onClicked: root.doPlayPause()
                 }
                 SkipButton {
+                    visible: buttonsRow.shown === "all"
                     forward: true
-                    size: bar.thick * 0.9
+                    segment: "right"
+                    size: bar.buttonSize
                     glyphColor: root.cActive
                     enabled: root.playerMatches && root.trackTitle !== "" && root.player.canGoNext
                     onClicked: root.doNext()
@@ -1155,10 +1317,12 @@ PlasmoidItem {
             MarqueeText {
                 Layout.fillWidth: true
                 text: root.dispTitle !== "" ? Lrc.normalize(root.dispTitle) : i18n("Nothing playing")
-                font.family: root.cfgFont
-                fontCss: root.cfgFontCss
-                font.pixelSize: Kirigami.Theme.defaultFont.pixelSize * 1.3
-                font.bold: true
+                family: root.textFont
+                fontCss: root.textCss
+                pixelSize: root.textPx(Kirigami.Theme.defaultFont.pixelSize * 1.3)
+                weight: root.textWeight(Font.Bold)
+                pixel: root.pixelReady
+                pixelFactor: root.pixelFactor(Kirigami.Theme.defaultFont.pixelSize * 1.3)
                 color: root.cActive
                 scrolling: Plasmoid.configuration.marquee && root.expanded && root.winVisible
             }
@@ -1168,8 +1332,11 @@ PlasmoidItem {
                 text: root.dispArtist !== "" ? Lrc.normalize(root.dispArtist) : " "
                 color: root.cActive
                 textOpacity: 0.7
-                font.family: root.cfgFont
-                fontCss: root.cfgFontCss
+                family: root.textFont
+                fontCss: root.textCss
+                pixelSize: root.textPx(Kirigami.Theme.defaultFont.pixelSize)
+                pixel: root.pixelReady
+                pixelFactor: root.pixelFactor(Kirigami.Theme.defaultFont.pixelSize)
                 scrolling: Plasmoid.configuration.marquee && root.expanded && root.winVisible
             }
 
@@ -1181,10 +1348,14 @@ PlasmoidItem {
                                                   && root.lineIdx < root.lines.length && root.isPlaying
                 text: showLyric ? (root.lines[root.lineIdx].text || "♪")
                     : (root.isActive && !root.haveSynced && !root.fetching ? i18n("No synced lyrics found") : " ")
-                font.family: root.cfgFont
-                fontCss: root.cfgFontCss
-                font.italic: showLyric
-                font.pixelSize: showLyric ? Kirigami.Theme.defaultFont.pixelSize : Kirigami.Theme.smallFont.pixelSize
+                readonly property real basePx: showLyric ? Kirigami.Theme.defaultFont.pixelSize : Kirigami.Theme.smallFont.pixelSize
+                family: root.textFont
+                fontCss: root.textCss
+                // a faked slant would smear the pixel font
+                italic: showLyric && !root.pixelReady
+                pixelSize: root.textPx(basePx)
+                pixel: root.pixelReady
+                pixelFactor: root.pixelFactor(basePx)
                 color: root.cActive
                 textOpacity: showLyric ? 0.9 : 0.5
                 scrolling: Plasmoid.configuration.marquee && root.expanded && root.winVisible
@@ -1296,26 +1467,33 @@ PlasmoidItem {
                     enabled: root.hasTrack && root.canShuffle
                     onClicked: root.doShuffle()
                 }
-                SkipButton {
-                    forward: false
-                    size: Kirigami.Units.iconSizes.medium
-                    glyphColor: root.cActive
-                    enabled: root.playerMatches && root.trackTitle !== "" && root.player.canGoPrevious
-                    onClicked: root.doPrev()
-                }
-                PlayButton {
-                    playing: root.isPlaying
-                    size: Kirigami.Units.iconSizes.medium
-                    glyphColor: root.cActive
-                    enabled: root.playerMatches && root.trackTitle !== ""
-                    onClicked: root.doPlayPause()
-                }
-                SkipButton {
-                    forward: true
-                    size: Kirigami.Units.iconSizes.medium
-                    glyphColor: root.cActive
-                    enabled: root.playerMatches && root.trackTitle !== "" && root.player.canGoNext
-                    onClicked: root.doNext()
+                // prev/play/next sit flush in the capsule style so the pill joins up
+                RowLayout {
+                    spacing: Plasmoid.configuration.buttonStyle === "capsule" ? 0 : Kirigami.Units.largeSpacing
+                    SkipButton {
+                        forward: false
+                        segment: "left"
+                        size: Kirigami.Units.iconSizes.medium
+                        glyphColor: root.cActive
+                        enabled: root.playerMatches && root.trackTitle !== "" && root.player.canGoPrevious
+                        onClicked: root.doPrev()
+                    }
+                    PlayButton {
+                        playing: root.isPlaying
+                        segment: "middle"
+                        size: Kirigami.Units.iconSizes.medium
+                        glyphColor: root.cActive
+                        enabled: root.playerMatches && root.trackTitle !== ""
+                        onClicked: root.doPlayPause()
+                    }
+                    SkipButton {
+                        forward: true
+                        segment: "right"
+                        size: Kirigami.Units.iconSizes.medium
+                        glyphColor: root.cActive
+                        enabled: root.playerMatches && root.trackTitle !== "" && root.player.canGoNext
+                        onClicked: root.doNext()
+                    }
                 }
                 GlyphButton {
                     readonly property bool loopTrack: root.repeatMode === "ONE"
@@ -1401,6 +1579,11 @@ PlasmoidItem {
                     horizontalAlignment: Text.AlignRight
                     Layout.preferredWidth: Kirigami.Units.gridUnit * 1.6
                 }
+            }
+
+            // playlists, only shown while Soloist is running
+            PlaylistBox {
+                Layout.fillWidth: true
             }
 
             // start stop buttons

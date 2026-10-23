@@ -162,24 +162,31 @@ Item {
             if (++ticks >= 25) {
                 stop();
                 if (api.searchError === "" && !api.searching)
-                    api.searchError = i18n("Spotify didn't start. Check the Start command in the widget settings");
+                    api.searchError = root.soloistMode
+                        ? i18n("Spotify Soloist didn't start. Check its setup in the Music App settings")
+                        : i18n("Spotify didn't start. Check the Start command in the widget settings");
             }
         }
     }
 
+    // in Spotify Soloist mode the "app" is the Soloist service (its bridge follows it)
     function launchApp() {
-        var cmd = (Plasmoid.configuration.spotifyLaunchCmd || "gtk-launch com.spotify.Client").trim();
+        var cmd = root.soloistMode ? "systemctl --user start soloist.service"
+            : (Plasmoid.configuration.spotifyLaunchCmd || "gtk-launch com.spotify.Client").trim();
         if (cmd === "") return;
         root.runCmdWatch("sh -c '( " + cmd.split("'").join("") + " ) >/dev/null 2>&1 & p=$!; sleep 2; st=$(ps -o state= -p $p 2>/dev/null); if [ -n \"$st\" ] && [ \"$st\" != \"Z\" ]; then echo chorus-ok; elif wait $p; then echo chorus-ok; else echo chorus-fail; fi'",
             function (out) {
                 if (out.indexOf("chorus-fail") === -1 || root.searchAppRunning) return;
                 launchWatch.stop();
-                api.searchError = i18n("Spotify couldn't start. Check the Start command in the widget settings");
+                api.searchError = root.soloistMode
+                    ? i18n("Spotify Soloist couldn't start. Check its setup in the Music App settings")
+                    : i18n("Spotify couldn't start. Check the Start command in the widget settings");
             });
         if (!root.searchAppRunning) { launchWatch.ticks = 0; launchWatch.restart(); }
     }
     function closeApp() {
-        var cmd = (Plasmoid.configuration.spotifyCloseCmd || "pkill -9 -f spotify").trim().split("'").join("");
+        var cmd = (root.soloistMode ? "systemctl --user stop soloist.service"
+            : (Plasmoid.configuration.spotifyCloseCmd || "pkill -9 -f spotify")).trim().split("'").join("");
         if (cmd === "") return;
         root.runCmd("sh -c '" + cmd + " >/dev/null 2>&1'");
     }

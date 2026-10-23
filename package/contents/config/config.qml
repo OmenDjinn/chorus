@@ -9,7 +9,7 @@ ConfigModel {
     }
     ConfigCategory {
         name: i18n("Music App")
-        icon: "folder-music-symbolic"
+        icon: "audio-speakers-symbolic"
         source: "configMusicApp.qml"
     }
 }
