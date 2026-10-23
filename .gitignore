@@ -1,0 +1,5 @@
+/soloist-mpris-rs/target/
+__pycache__/
+*.pyc
+/tests/*.png
+/tests/fonts-dl/
