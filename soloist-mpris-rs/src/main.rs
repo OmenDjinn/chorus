@@ -5,6 +5,10 @@
 //! matching commands. Also exposes org.chorus.Soloist with GetPlaylists (the
 //! user's library, fetched by webapi.py next to this binary), PlayUri and Status
 //! for the Chorus widget.
+//!
+//! Spotify drops a paused device's session after a while (and Soloist starts without one
+//! after a reboot), forgetting the playlist. The bridge remembers the last playlist, track
+//! and position, keeps showing that track as paused, and on play brings it back.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -13,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value as Json, json};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 use zbus::object_server::{InterfaceRef, SignalEmitter};
 use zbus::zvariant::{ObjectPath, OwnedValue, Value};
@@ -26,6 +30,8 @@ const SEEK_JUMP_MS: f64 = 1500.0;
 /// Like Spotify: past this point Previous restarts the track, before it goes back one.
 const RESTART_THRESHOLD_MS: f64 = 3000.0;
 const PLAYLIST_CACHE: Duration = Duration::from_secs(60);
+/// A restore skips forward to the saved track; further than this it queues the track instead.
+const MAX_RESTORE_SKIPS: usize = 300;
 
 fn now_ms() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0)
@@ -37,6 +43,15 @@ fn data_dir() -> PathBuf {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
         .unwrap_or_default()
         .join("soloist")
+}
+
+/// Where the last-played state is kept across bridge restarts and reboots.
+fn saved_file() -> PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_default()
+        .join("soloist-mpris/last.json")
 }
 
 fn entity_name(entity: &Json) -> &str {
@@ -57,9 +72,87 @@ struct State {
     pos_ms: f64,
     pos_stamp_ms: f64,
     speed: f64,
+    /// Soloist's current context (playlist, album, Liked Songs)
+    context: String,
+    /// upcoming track URIs from the last queue answer, None while waiting for one
+    queue: Option<Vec<String>>,
+    /// what was last playing, to bring back after Spotify drops the session
+    saved: Option<Saved>,
+    /// the session is gone; the saved track is shown as paused until play restores it
+    detached: bool,
+    /// a restore is running: clients aren't told about the intermediate states
+    restoring: bool,
+}
+
+#[derive(Clone)]
+struct Saved {
+    context: String,
+    track: String,
+    pos_ms: f64,
+    item: Json,
+}
+
+impl Saved {
+    fn load() -> Option<Saved> {
+        let v: Json = serde_json::from_str(&std::fs::read_to_string(saved_file()).ok()?).ok()?;
+        Some(Saved {
+            context: v["context"].as_str()?.to_owned(),
+            track: v["track"].as_str()?.to_owned(),
+            pos_ms: v["pos_ms"].as_f64().unwrap_or(0.0),
+            item: v.get("item").filter(|i| i.is_object())?.clone(),
+        })
+    }
+
+    fn store(&self) {
+        let path = saved_file();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let v = json!({ "context": self.context, "track": self.track, "pos_ms": self.pos_ms, "item": self.item });
+        let _ = std::fs::write(path, v.to_string());
+    }
 }
 
 impl State {
+    /// Records what's playing while Soloist holds a session with a context.
+    fn remember(&mut self) {
+        if self.restoring || self.detached || !self.is_active || self.context.is_empty() {
+            return;
+        }
+        let Some(item) = self.item.clone() else { return };
+        let track = self.uri().to_owned();
+        if track.is_empty() {
+            return;
+        }
+        let changed = self.saved.as_ref().is_none_or(|s| s.context != self.context || s.track != track);
+        let pos_ms = self.position_ms();
+        self.saved = Some(Saved { context: self.context.clone(), track, pos_ms, item });
+        // the file only needs to follow track changes and pauses, not every position update
+        if (changed || self.status == "paused")
+            && let Some(saved) = &self.saved
+        {
+            saved.store();
+        }
+    }
+
+    /// The session is gone: keep showing the saved track as paused, or nothing at all.
+    fn detach(&mut self) {
+        if self.restoring {
+            return;
+        }
+        match self.saved.clone() {
+            Some(saved) => {
+                saved.store();
+                self.detached = true;
+                self.item = Some(saved.item);
+                self.status = "paused".to_owned();
+                self.pos_ms = saved.pos_ms;
+                self.pos_stamp_ms = now_ms();
+            }
+            None => self.set_status("idle"),
+        }
+    }
+
     fn position_ms(&self) -> f64 {
         if self.status != "playing" {
             return self.pos_ms;
@@ -137,6 +230,10 @@ impl State {
     }
 
     fn can(&self, action: &str) -> bool {
+        if self.detached {
+            // everything works again once play restores the session
+            return self.connected;
+        }
         self.connected && self.item.is_some() && self.actions.iter().any(|a| a == action)
     }
 
@@ -275,14 +372,31 @@ impl Root {
 struct Player {
     state: Shared,
     cmd: Commands,
+    refresh: Arc<Notify>,
+}
+
+impl Player {
+    /// Restores the dropped session, then runs `then` (e.g. skip_next); false if attached.
+    fn restore_then(&self, then: Option<&'static str>) -> bool {
+        if !self.state.lock().unwrap().detached {
+            return false;
+        }
+        tokio::spawn(restore(self.state.clone(), self.cmd.clone(), self.refresh.clone(), then));
+        true
+    }
 }
 
 #[interface(name = "org.mpris.MediaPlayer2.Player")]
 impl Player {
     fn next(&self) {
-        self.cmd.simple("skip_next");
+        if !self.restore_then(Some("skip_next")) {
+            self.cmd.simple("skip_next");
+        }
     }
     fn previous(&self) {
+        if self.restore_then(Some("skip_prev")) {
+            return;
+        }
         let restart = {
             let s = self.state.lock().unwrap();
             // on the first track there's nothing to go back to, so restart it
@@ -301,11 +415,14 @@ impl Player {
         self.cmd.simple("pause");
     }
     fn play(&self) {
-        self.cmd.play(&self.state, None);
+        if !self.restore_then(None) {
+            self.cmd.play(&self.state, None);
+        }
     }
     fn play_pause(&self) {
         let playing = self.state.lock().unwrap().is_playing();
-        if playing {
+        if self.restore_then(None) {
+        } else if playing {
             self.cmd.simple("pause");
         } else {
             self.cmd.play(&self.state, None);
@@ -333,6 +450,7 @@ impl Player {
     }
     fn open_uri(&self, uri: &str) {
         if uri.starts_with("spotify:") {
+            self.state.lock().unwrap().detached = false;
             self.cmd.play(&self.state, Some(uri));
         }
     }
@@ -465,6 +583,7 @@ impl Chorus {
 
     fn play_uri(&self, uri: &str) {
         if uri.starts_with("spotify:") {
+            self.state.lock().unwrap().detached = false;
             self.cmd.play(&self.state, Some(uri));
         }
     }
@@ -484,39 +603,72 @@ fn apply_event(state: &mut State, ev: &Json) -> bool {
     let mut position_update = false;
     match ev["type"].as_str().unwrap_or("") {
         "playback_state" => {
+            let active = ev["is_active"].as_bool().unwrap_or(false);
+            if !active && (state.detached || state.saved.is_some()) && !state.restoring {
+                // no session: keep showing the saved track instead of an empty state
+                state.is_active = false;
+                state.set_options(&ev["options"]);
+                if !state.detached {
+                    state.detach();
+                }
+                return false;
+            }
+            if active && state.detached && !state.restoring {
+                // another device started playback here, it brought its own context
+                state.detached = false;
+            }
             if let Some(status) = ev["status"].as_str() {
                 state.set_status(status);
             }
             state.item = ev.get("item").filter(|i| i.is_object()).cloned();
-            state.volume = ev["volume"].as_f64().unwrap_or(100.0) / 100.0;
+            state.context = ev["context"]["uri"].as_str().unwrap_or("").to_owned();
+            if !state.restoring {
+                // muted while restoring; clients keep seeing the real volume
+                state.volume = ev["volume"].as_f64().unwrap_or(100.0) / 100.0;
+            }
             state.set_options(&ev["options"]);
             state.actions = ev["available_actions"]
                 .as_object()
                 .map(|a| a.keys().cloned().collect())
                 .unwrap_or_default();
-            state.is_active = ev["is_active"].as_bool().unwrap_or(false);
+            state.is_active = active;
             state.set_position(&ev["position"]);
             position_update = ev["position"].is_object();
         }
-        "track_changed" => {
+        "track_changed" if !state.detached || state.restoring => {
             state.item = ev.get("item").filter(|i| i.is_object()).cloned();
             state.pos_ms = 0.0;
             state.pos_stamp_ms = now_ms();
         }
-        "playback_changed" => {
+        "context_changed" => {
+            state.context = ev["context"]["uri"].as_str().unwrap_or("").to_owned();
+        }
+        "playback_changed" if !state.detached || state.restoring => {
             if let Some(status) = ev["status"].as_str() {
                 state.set_status(status);
             }
         }
-        "volume_changed" => state.volume = ev["volume"].as_f64().unwrap_or(100.0) / 100.0,
+        "volume_changed" if !state.restoring => {
+            state.volume = ev["volume"].as_f64().unwrap_or(100.0) / 100.0;
+        }
         "options_changed" => state.set_options(&ev["options"]),
+        "queue_changed" => {
+            state.queue = Some(
+                ev["upcoming"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e["item"]["uri"].as_str().map(str::to_owned))
+                    .collect(),
+            );
+        }
         "device_changed" => {
             state.is_active = ev["is_active"].as_bool().unwrap_or(false);
             if !state.is_active {
-                state.set_status("idle");
+                state.detach();
             }
         }
-        "position_sync" => {
+        "position_sync" if !state.detached || state.restoring => {
             state.set_position(&ev["position"]);
             position_update = true;
         }
@@ -527,11 +679,100 @@ fn apply_event(state: &mut State, ev: &Json) -> bool {
         "error" => eprintln!("soloist error: {}", ev["message"].as_str().unwrap_or("?")),
         _ => {}
     }
+    state.remember();
     position_update && !uri.is_empty() && state.uri() == uri
         && (state.position_ms() - expected).abs() > SEEK_JUMP_MS
 }
 
-async fn emit(player: &InterfaceRef<Player>, old: &Snapshot, seeked: bool) -> zbus::Result<()> {
+/// Polls the shared state until `done` holds or `limit` passes.
+async fn wait_for(state: &Shared, limit: Duration, done: impl Fn(&State) -> bool) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < limit {
+        if done(&state.lock().unwrap()) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// Brings back the saved playlist at the saved track and position after Spotify dropped
+/// the session: Soloist can only start a context from its beginning, so this starts it
+/// muted, skips forward to the track (or queues it when shuffled or far away), seeks,
+/// and unmutes. Clients see none of the steps, only the result.
+async fn restore(state: Shared, cmd: Commands, refresh: Arc<Notify>, then: Option<&'static str>) {
+    let (saved, volume, shuffle) = {
+        let mut s = state.lock().unwrap();
+        if s.restoring || !s.detached {
+            return;
+        }
+        let Some(saved) = s.saved.clone() else { return };
+        s.restoring = true;
+        (saved, s.volume, s.shuffle)
+    };
+    let volume = (volume * 100.0).round().clamp(0.0, 100.0) as i64;
+    // Soloist ignores the volume until it's the active device, so take over first
+    cmd.simple("activate");
+    wait_for(&state, Duration::from_secs(5), |s| s.is_active).await;
+    cmd.send("set_volume", json!({ "volume": 0 }));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    cmd.send("play", json!({ "uri": saved.context }));
+    let started = wait_for(&state, Duration::from_secs(8), |s| {
+        s.is_active && s.context == saved.context && !s.uri().is_empty() && s.is_playing()
+    })
+    .await;
+    let at_track = |s: &State| s.uri() == saved.track;
+    if started && !at_track(&state.lock().unwrap()) {
+        let mut queued = shuffle;
+        let mut skips = 1;
+        if !shuffle {
+            state.lock().unwrap().queue = None;
+            cmd.send("get_queue", json!({ "limit": 0 }));
+            wait_for(&state, Duration::from_secs(2), |s| {
+                s.queue.as_ref().is_some_and(|q| q.contains(&saved.track))
+            })
+            .await;
+            let index = state.lock().unwrap().queue.as_ref()
+                .and_then(|q| q.iter().position(|t| *t == saved.track));
+            match index {
+                Some(i) if i < MAX_RESTORE_SKIPS => {
+                    skips = i + 1;
+                    for _ in 0..skips {
+                        cmd.simple("skip_next");
+                    }
+                }
+                _ => queued = true,
+            }
+        }
+        if queued {
+            // shuffled, or not found in order: play it next, the context continues after it
+            cmd.send("add_to_queue", json!({ "uri": saved.track }));
+            cmd.simple("skip_next");
+        }
+        // each skip loads a track, so allow more time the further it is
+        wait_for(&state, Duration::from_millis(5000 + 150 * skips as u64), at_track).await;
+    }
+    if saved.pos_ms > RESTART_THRESHOLD_MS && at_track(&state.lock().unwrap()) {
+        cmd.send("seek", json!({ "position_ms": saved.pos_ms as i64 }));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    cmd.send("set_volume", json!({ "volume": volume }));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    {
+        let mut s = state.lock().unwrap();
+        s.restoring = false;
+        s.detached = false;
+        s.volume = volume as f64 / 100.0;
+        s.remember();
+    }
+    if let Some(then) = then {
+        cmd.simple(then);
+    }
+    refresh.notify_one();
+}
+
+/// Tells clients what differs between what they last saw and the current state.
+async fn emit(player: &InterfaceRef<Player>, old: &Snapshot, seeked: bool) -> zbus::Result<Snapshot> {
     let p = player.get().await;
     let e = player.signal_emitter();
     let new = p.state.lock().unwrap().snapshot();
@@ -561,7 +802,7 @@ async fn emit(player: &InterfaceRef<Player>, old: &Snapshot, seeked: bool) -> zb
         let pos = (p.state.lock().unwrap().position_ms() * 1000.0) as i64;
         Player::seeked(e, pos).await?;
     }
-    Ok(())
+    Ok(new)
 }
 
 async fn endpoint() -> Option<String> {
@@ -572,8 +813,15 @@ async fn endpoint() -> Option<String> {
 }
 
 /// Keeps a WebSocket connection to Soloist, reconnecting whenever it drops.
-async fn follow_soloist(state: Shared, player: InterfaceRef<Player>, mut rx: mpsc::UnboundedReceiver<String>) {
+async fn follow_soloist(
+    state: Shared,
+    player: InterfaceRef<Player>,
+    refresh: Arc<Notify>,
+    mut rx: mpsc::UnboundedReceiver<String>,
+) {
     let mut was_connected = false;
+    // what clients last saw, so changes made during a restore are announced once at the end
+    let mut client = state.lock().unwrap().snapshot();
     loop {
         let conn = match endpoint().await {
             Some(url) => tokio::time::timeout(Duration::from_secs(5), tokio_tungstenite::connect_async(url))
@@ -594,13 +842,15 @@ async fn follow_soloist(state: Shared, player: InterfaceRef<Player>, mut rx: mps
                     msg = read.next() => match msg {
                         Some(Ok(Message::Text(text))) => {
                             let Ok(ev) = serde_json::from_str::<Json>(&text) else { continue };
-                            let (old, seeked) = {
+                            let (seeked, quiet) = {
                                 let mut s = state.lock().unwrap();
-                                let old = s.snapshot();
-                                (old, apply_event(&mut s, &ev))
+                                (apply_event(&mut s, &ev), s.restoring)
                             };
-                            if let Err(e) = emit(&player, &old, seeked).await {
-                                eprintln!("emit failed: {e}");
+                            if !quiet {
+                                match emit(&player, &client, seeked).await {
+                                    Ok(new) => client = new,
+                                    Err(e) => eprintln!("emit failed: {e}"),
+                                }
                             }
                         }
                         Some(Ok(_)) => {}
@@ -611,21 +861,27 @@ async fn follow_soloist(state: Shared, player: InterfaceRef<Player>, mut rx: mps
                         Some(cmd) => if write.send(Message::text(cmd)).await.is_err() { break },
                         None => return,
                     },
+                    // a restore finished: announce where it ended up, the position jumped too
+                    () = refresh.notified() => match emit(&player, &client, true).await {
+                        Ok(new) => client = new,
+                        Err(e) => eprintln!("emit failed: {e}"),
+                    },
                 }
             }
         }
         if was_connected {
             was_connected = false;
-            let old = {
+            {
                 let mut s = state.lock().unwrap();
-                let old = s.snapshot();
                 s.connected = false;
                 s.logged_in = false;
-                s.status = "idle".to_owned();
-                s.item = None;
-                old
-            };
-            let _ = emit(&player, &old, false).await;
+                s.is_active = false;
+                s.restoring = false;
+                s.detach();
+            }
+            if let Ok(new) = emit(&player, &client, false).await {
+                client = new;
+            }
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
@@ -633,13 +889,14 @@ async fn follow_soloist(state: Shared, player: InterfaceRef<Player>, mut rx: mps
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> zbus::Result<()> {
-    let state: Shared = Arc::new(Mutex::new(State { volume: 1.0, ..Default::default() }));
+    let state: Shared = Arc::new(Mutex::new(State { volume: 1.0, saved: Saved::load(), ..Default::default() }));
     let (tx, rx) = mpsc::unbounded_channel();
     let cmd = Commands(tx);
+    let refresh = Arc::new(Notify::new());
 
     let conn = zbus::connection::Builder::session()?
         .serve_at(PATH, Root)?
-        .serve_at(PATH, Player { state: state.clone(), cmd: cmd.clone() })?
+        .serve_at(PATH, Player { state: state.clone(), cmd: cmd.clone(), refresh: refresh.clone() })?
         .serve_at(PATH, Chorus { state: state.clone(), cmd, playlists: Default::default() })?
         .name(BUS_NAME)?
         .build()
@@ -647,6 +904,6 @@ async fn main() -> zbus::Result<()> {
     eprintln!("published {BUS_NAME}");
 
     let player = conn.object_server().interface::<_, Player>(PATH).await?;
-    follow_soloist(state, player, rx).await;
+    follow_soloist(state, player, refresh, rx).await;
     Ok(())
 }
